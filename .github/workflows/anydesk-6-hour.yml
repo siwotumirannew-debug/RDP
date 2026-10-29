@@ -1,118 +1,145 @@
-name: Windows ARM + AnyDesk (6-hour session)
+
+name: Windows ARM AnyDesk - 6 Hours
 
 on:
   workflow_dispatch:
 
-# IMPORTANT:
-# - This workflow is intended for a Windows machine/runner you own or are
-#   authorized to administer.
-# - Use a PRIVATE repository. The generated credentials artifact grants remote access.
-# - GitHub-hosted runners are temporary and are not a reliable permanent RDP desktop.
-# - The runner label below must exist in your own runner configuration.
+permissions:
+  contents: read
 
 jobs:
   setup-anydesk:
-    # Change this label to match your authorized Windows ARM self-hosted runner.
+    # Runner harus tersedia dan Anda memiliki izin mengelolanya.
     runs-on: windows-11-vs2026-arm
     timeout-minutes: 360
-
-    permissions:
-      contents: read
 
     steps:
       - name: Install AnyDesk
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
+
           $installer = Join-Path $env:TEMP 'AnyDesk.exe'
+
           Invoke-WebRequest `
             -Uri 'https://download.anydesk.com/AnyDesk.exe' `
             -OutFile $installer
 
-          # Install/update AnyDesk. The exact CLI behavior can vary by version.
-          Start-Process -FilePath $installer `
-            -ArgumentList '--install "C:\Program Files (x86)\AnyDesk" --silent' `
+          $installDir = 'C:\Program Files (x86)\AnyDesk'
+
+          Start-Process `
+            -FilePath $installer `
+            -ArgumentList "--install `"$installDir`" --silent" `
             -Wait
 
           $possiblePaths = @(
             'C:\Program Files (x86)\AnyDesk\AnyDesk.exe',
-            'C:\Program Files\AnyDesk\AnyDesk.exe',
-            $installer
+            'C:\Program Files\AnyDesk\AnyDesk.exe'
           )
+
           $anydesk = $possiblePaths |
             Where-Object { Test-Path $_ } |
             Select-Object -First 1
 
           if (-not $anydesk) {
-            throw 'AnyDesk executable was not found after installation.'
+            throw 'AnyDesk executable tidak ditemukan.'
           }
 
-          "ANYDESK_EXE=$anydesk" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "ANYDESK_EXE=$anydesk" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Configure unattended access and create credentials
+      - name: Configure AnyDesk credentials
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
 
-          # Create a strong random password. This is stored only in the
-          # private workflow artifact, not printed into the job log.
-          $bytes = New-Object byte[] 24
-          [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
-          $password = [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+','A').Replace('/','B')
+          if (-not (Test-Path $env:ANYDESK_EXE)) {
+            throw 'AnyDesk executable tidak ditemukan.'
+          }
 
-          # AnyDesk supports setting an unattended-access password via stdin
-          # on supported versions. If this command fails, configure it using
-          # AnyDesk's official Security settings on the machine.
+          # Kompatibel dengan .NET versi lama.
+          $rng = New-Object System.Security.Cryptography.RNGCryptoServiceProvider
+          $bytes = New-Object byte[] 24
+
+          try {
+            $rng.GetBytes($bytes)
+          }
+          finally {
+            $rng.Dispose()
+          }
+
+          $password = [Convert]::ToBase64String($bytes).
+            TrimEnd('=').
+            Replace('+', 'A').
+            Replace('/', 'B')
+
+          # Perintah ini harus didukung versi AnyDesk yang dipasang.
           $password | & $env:ANYDESK_EXE --set-password
+
           if ($LASTEXITCODE -ne 0) {
-            throw 'Could not set the AnyDesk password. Check the installed AnyDesk version and configure unattended access manually.'
+            throw 'Gagal mengatur password AnyDesk. Periksa dukungan CLI versi yang terpasang.'
           }
 
           Start-Sleep -Seconds 5
+
           $idOutput = & $env:ANYDESK_EXE --get-id
           $id = ($idOutput | Out-String).Trim()
 
           if ([string]::IsNullOrWhiteSpace($id)) {
-            throw 'Could not retrieve the AnyDesk ID.'
+            throw 'AnyDesk ID tidak berhasil diperoleh.'
           }
 
-          New-Item -ItemType Directory -Force -Path 'session-info' | Out-Null
-          @"
+          $directory = Join-Path $PWD 'session-info'
+          New-Item -ItemType Directory -Force -Path $directory |
+            Out-Null
+
+          $content = @"
           AnyDesk ID: $id
           Password: $password
           Session duration: 6 hours
-          "@ | Set-Content -Path 'session-info/credentials.txt' -Encoding UTF8
+          "@
 
-          # Avoid exposing credentials in logs.
-          Write-Host "AnyDesk is configured. Download the credentials artifact from this private workflow run."
+          $file = Join-Path $directory 'credentials.txt'
+          Set-Content -Path $file -Value $content -Encoding UTF8
+
+          # Password tidak ditampilkan di log.
           Write-Host "AnyDesk ID: $id"
+          Write-Host 'Kredensial tersedia sebagai artefak privat.'
 
-      - name: Keep session alive for six hours
+      - name: Six-hour countdown
         shell: powershell
         run: |
+          $ErrorActionPreference = 'Stop'
           $end = (Get-Date).AddHours(6)
+
           while ((Get-Date) -lt $end) {
             $remaining = [int]($end - (Get-Date)).TotalSeconds
+
             $hours = [math]::Floor($remaining / 3600)
             $minutes = [math]::Floor(($remaining % 3600) / 60)
             $seconds = $remaining % 60
-            Write-Host ("Time remaining: {0:D2}:{1:D2}:{2:D2}" -f $hours, $minutes, $seconds)
-            Start-Sleep -Seconds ([Math]::Min(60, [Math]::Max(1, $remaining)))
+
+            Write-Host (
+              'Time remaining: {0:D2}:{1:D2}:{2:D2}' -f
+              $hours, $minutes, $seconds
+            )
+
+            Start-Sleep -Seconds (
+              [Math]::Min(60, [Math]::Max(1, $remaining))
+            )
           }
 
-      - name: Upload credentials artifact
-        if: always()
+      - name: Upload credentials
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: anydesk-session-credentials
           path: session-info/credentials.txt
           retention-days: 1
-          if-no-files-found: warn
+          if-no-files-found: error
 
-      - name: End session
+      - name: Finish session
         if: always()
         shell: powershell
         run: |
-          # This ends the workflow step; it does not necessarily uninstall
-          # AnyDesk or shut down a self-hosted machine.
-          Write-Host 'Six-hour workflow window ended.'
+          Write-Host 'Workflow enam jam telah selesai.'
