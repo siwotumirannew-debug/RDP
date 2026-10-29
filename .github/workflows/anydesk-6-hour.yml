@@ -1,0 +1,118 @@
+name: Windows ARM + AnyDesk (6-hour session)
+
+on:
+  workflow_dispatch:
+
+# IMPORTANT:
+# - This workflow is intended for a Windows machine/runner you own or are
+#   authorized to administer.
+# - Use a PRIVATE repository. The generated credentials artifact grants remote access.
+# - GitHub-hosted runners are temporary and are not a reliable permanent RDP desktop.
+# - The runner label below must exist in your own runner configuration.
+
+jobs:
+  setup-anydesk:
+    # Change this label to match your authorized Windows ARM self-hosted runner.
+    runs-on: [self-hosted, Windows, ARM64]
+    timeout-minutes: 360
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Install AnyDesk
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Join-Path $env:TEMP 'AnyDesk.exe'
+          Invoke-WebRequest `
+            -Uri 'https://download.anydesk.com/AnyDesk.exe' `
+            -OutFile $installer
+
+          # Install/update AnyDesk. The exact CLI behavior can vary by version.
+          Start-Process -FilePath $installer `
+            -ArgumentList '--install "C:\Program Files (x86)\AnyDesk" --silent' `
+            -Wait
+
+          $possiblePaths = @(
+            'C:\Program Files (x86)\AnyDesk\AnyDesk.exe',
+            'C:\Program Files\AnyDesk\AnyDesk.exe',
+            $installer
+          )
+          $anydesk = $possiblePaths |
+            Where-Object { Test-Path $_ } |
+            Select-Object -First 1
+
+          if (-not $anydesk) {
+            throw 'AnyDesk executable was not found after installation.'
+          }
+
+          "ANYDESK_EXE=$anydesk" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Configure unattended access and create credentials
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # Create a strong random password. This is stored only in the
+          # private workflow artifact, not printed into the job log.
+          $bytes = New-Object byte[] 24
+          [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+          $password = [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+','A').Replace('/','B')
+
+          # AnyDesk supports setting an unattended-access password via stdin
+          # on supported versions. If this command fails, configure it using
+          # AnyDesk's official Security settings on the machine.
+          $password | & $env:ANYDESK_EXE --set-password
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Could not set the AnyDesk password. Check the installed AnyDesk version and configure unattended access manually.'
+          }
+
+          Start-Sleep -Seconds 5
+          $idOutput = & $env:ANYDESK_EXE --get-id
+          $id = ($idOutput | Out-String).Trim()
+
+          if ([string]::IsNullOrWhiteSpace($id)) {
+            throw 'Could not retrieve the AnyDesk ID.'
+          }
+
+          New-Item -ItemType Directory -Force -Path 'session-info' | Out-Null
+          @"
+          AnyDesk ID: $id
+          Password: $password
+          Session duration: 6 hours
+          "@ | Set-Content -Path 'session-info/credentials.txt' -Encoding UTF8
+
+          # Avoid exposing credentials in logs.
+          Write-Host "AnyDesk is configured. Download the credentials artifact from this private workflow run."
+          Write-Host "AnyDesk ID: $id"
+
+      - name: Keep session alive for six hours
+        shell: powershell
+        run: |
+          $end = (Get-Date).AddHours(6)
+          while ((Get-Date) -lt $end) {
+            $remaining = [int]($end - (Get-Date)).TotalSeconds
+            $hours = [math]::Floor($remaining / 3600)
+            $minutes = [math]::Floor(($remaining % 3600) / 60)
+            $seconds = $remaining % 60
+            Write-Host ("Time remaining: {0:D2}:{1:D2}:{2:D2}" -f $hours, $minutes, $seconds)
+            Start-Sleep -Seconds ([Math]::Min(60, [Math]::Max(1, $remaining)))
+          }
+
+      - name: Upload credentials artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: anydesk-session-credentials
+          path: session-info/credentials.txt
+          retention-days: 1
+          if-no-files-found: warn
+
+      - name: End session
+        if: always()
+        shell: powershell
+        run: |
+          # This ends the workflow step; it does not necessarily uninstall
+          # AnyDesk or shut down a self-hosted machine.
+          Write-Host 'Six-hour workflow window ended.'
