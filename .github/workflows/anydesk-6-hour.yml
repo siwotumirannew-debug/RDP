@@ -13,7 +13,7 @@ on:
 jobs:
   setup-anydesk:
     # Change this label to match your authorized Windows ARM self-hosted runner.
-    runs-on: [self-hosted, Windows, ARM64]
+    runs-on: windows-11-vs2026-arm
     timeout-minutes: 360
 
     permissions:
